@@ -101,8 +101,6 @@ async def scrape_members_discum(guild_id, channel_id, token):
                             member_ids.add(uid)
                         except (KeyError, TypeError):
                             pass
-                    # Close immediately after first chunk? No, we need all chunks.
-                    # We'll let the timeout handle it.
             
             bot.gateway.run(auto_reconnect=False, stop_event=stop_scraping)
         except Exception as e:
@@ -148,7 +146,7 @@ class MemberMonitor(discord.Client):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.poll_task = None
-        self.session = None  # aiohttp session for notifications
+        self.session = None  # shared aiohttp session for notifications
 
     async def on_ready(self):
         global client_ref, START_TIME
@@ -191,7 +189,6 @@ class MemberMonitor(discord.Client):
             # Launch all guild polls concurrently with staggered starts
             tasks = []
             for i, guild in enumerate(self.guilds):
-                # Stagger to avoid hitting rate limits
                 if i > 0:
                     await asyncio.sleep(GUILD_STAGGER_SEC)
                 tasks.append(self.loop.create_task(self.poll_guild(guild)))
@@ -202,7 +199,6 @@ class MemberMonitor(discord.Client):
             elapsed = time.time() - cycle_start
             print(f"✅ Poll cycle completed in {elapsed:.1f}s. Next cycle in {POLL_INTERVAL_SEC}s")
             
-            # Wait for next interval (subtract time already spent)
             wait_time = max(0, POLL_INTERVAL_SEC - elapsed)
             await asyncio.sleep(wait_time)
 
@@ -224,7 +220,6 @@ class MemberMonitor(discord.Client):
             
             # Large servers: use discum gateway scraping
             elif guild.member_count and guild.member_count >= 5000:
-                # Find a readable text channel
                 channel = next(
                     (c for c in guild.text_channels 
                      if c.permissions_for(guild.me).read_messages),
@@ -269,7 +264,6 @@ class MemberMonitor(discord.Client):
         """Compare members against Redis and send notifications"""
         guild_key = f"guild:{guild.id}:members"
         
-        # Check if first scan for this guild
         try:
             is_first_scan = await async_redis.exists(guild_key) == 0
         except Exception:
@@ -280,9 +274,6 @@ class MemberMonitor(discord.Client):
         effective_start = START_TIME - GRACE_PERIOD_MS
         poll_time = int(time.time() * 1000)
 
-        # Use pipeline? Upstash Redis doesn't support pipelines over HTTP easily.
-        # We'll do individual checks – but we can batch the sismember calls?
-        # For simplicity, keep as is.
         for user_id, member_data in members.items():
             try:
                 is_known = await async_redis.sismember(guild_key, user_id)
@@ -310,14 +301,12 @@ class MemberMonitor(discord.Client):
                     })
                 # else: silently add to Redis later
 
-        # Batch add all new IDs to Redis
         if new_ids:
             try:
                 await async_redis.sadd(guild_key, *new_ids)
             except Exception as e:
                 print(f"  Redis error: {e}")
 
-        # Send notifications concurrently
         if notifications:
             await asyncio.gather(*[self.send_notification(p) for p in notifications])
 
@@ -339,7 +328,6 @@ class MemberMonitor(discord.Client):
 
 # -------------------- MAIN --------------------
 if __name__ == "__main__":
-    # Start Flask in background thread
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     print("✅ Health server on port 3000")
@@ -356,6 +344,3 @@ if __name__ == "__main__":
         print("\n🛑 Shutting down...")
     except Exception as e:
         print(f"⚠️ Unexpected error: {e}")
-    finally:
-        # Cleanup is handled by asyncio
-        pass

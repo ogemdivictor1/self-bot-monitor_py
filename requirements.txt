@@ -1,0 +1,6 @@
+discord.py-self==1.9.14
+discum==1.4.8
+aiohttp==3.9.1
+flask==3.0.0
+python-dotenv==1.0.0
+upstash-redis==0.15.0

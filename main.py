@@ -151,12 +151,12 @@ class MemberMonitor(discord.Client):
     async def poll_guild(self, guild: discord.Guild):
         logger.info(f"Polling {guild.name} ({guild.id}) — {guild.member_count:,} members")
 
-        members_count = 0
         try:
             if guild.member_count and guild.member_count < 5000:
+                count = 0
                 async for member in guild.fetch_members(limit=None):
-                    members_count += 1
-                logger.info(f"  ✅ Fetched {members_count} members via API")
+                    count += 1
+                logger.info(f"  ✅ Fetched {count} members via API")
             else:
                 channel = next((c for c in guild.text_channels
                                 if c.permissions_for(guild.me).read_messages), None)
@@ -179,7 +179,7 @@ if __name__ == "__main__":
 
     client = MemberMonitor()
     try:
-        client.run(USER_TOKEN, bot=False)
+        client.run(USER_TOKEN)   # <-- FIXED: removed bot=False
     except discord.LoginFailure:
         logger.error("TOKEN EXPIRED OR INVALID")
     except KeyboardInterrupt:

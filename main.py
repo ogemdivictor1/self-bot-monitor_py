@@ -1,25 +1,24 @@
 import asyncio
 import discord
+from discord import Intents
 import discum
 import time
 import threading
 import os
-from datetime import datetime
 
-USER_TOKEN = os.getenv("USER_TOKEN")  # Still need your token
+USER_TOKEN = os.getenv("USER_TOKEN")
 
 if not USER_TOKEN:
     print("❌ USER_TOKEN environment variable not set")
     exit(1)
 
-# -------------------- CONFIG --------------------
 POLL_INTERVAL_SEC = 120
 DISCUM_TIMEOUT_SEC = 25
 
-# -------------------- DISCUM SCRAPER (logs only) --------------------
 async def scrape_members_discum(guild_id, channel_id, token):
     member_ids = set()
     stop_event = threading.Event()
+    last_size = 0
 
     def run_discum():
         bot = discum.Client(token=token, log=False)
@@ -44,17 +43,12 @@ async def scrape_members_discum(guild_id, channel_id, token):
     start = time.time()
     while time.time() - start < DISCUM_TIMEOUT_SEC:
         await asyncio.sleep(0.5)
-        if len(member_ids) > 100 and len(member_ids) == last_size:
+        if len(member_ids) == last_size and len(member_ids) > 100:
             break
         last_size = len(member_ids)
     stop_event.set()
     print(f"[DISCUM] Final: {len(member_ids)} members for guild {guild_id}")
     return member_ids
-
-# -------------------- DISCORD CLIENT --------------------
-intents = discord.Intents.default()
-intents.members = True
-intents.guilds = True
 
 class LogOnlyMonitor(discord.Client):
     async def on_ready(self):
@@ -86,7 +80,8 @@ class LogOnlyMonitor(discord.Client):
             else:
                 print(f"  ⚠️ No readable channel – using cache ({len(guild.members)} members)")
 
-# -------------------- RUN --------------------
 if __name__ == "__main__":
+    intents = Intents.default()
+    intents.members = True
     client = LogOnlyMonitor(intents=intents)
     client.run(USER_TOKEN, bot=False)

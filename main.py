@@ -1,5 +1,4 @@
 import asyncio
-import aiohttp
 import os
 import time
 import random
@@ -10,7 +9,6 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify
 import discord
 import discum
-from upstash_redis import AsyncRedis, Redis as SyncRedis
 
 load_dotenv()
 
@@ -22,28 +20,15 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # -------------------- CONFIG --------------------
-BASE_POLL_INTERVAL_SEC = 120
-MAX_POLL_INTERVAL_SEC = 600
-GRACE_PERIOD_MS = 2 * 60 * 1000
+POLL_INTERVAL_SEC = 120
 DISCUM_TIMEOUT_SEC = 25
 GUILD_STAGGER_SEC = 0.5
 
-NOTIFY_URL = os.getenv("NOTIFY_URL")
 USER_TOKEN = os.getenv("USER_TOKEN")
 
-if not USER_TOKEN or not NOTIFY_URL:
-    logger.error("Missing USER_TOKEN or NOTIFY_URL in environment")
+if not USER_TOKEN:
+    logger.error("Missing USER_TOKEN in environment")
     exit(1)
-
-# -------------------- REDIS --------------------
-async_redis = AsyncRedis(
-    url=os.getenv("UPSTASH_REDIS_REST_URL"),
-    token=os.getenv("UPSTASH_REDIS_REST_TOKEN")
-)
-sync_redis = SyncRedis(
-    url=os.getenv("UPSTASH_REDIS_REST_URL"),
-    token=os.getenv("UPSTASH_REDIS_REST_TOKEN")
-)
 
 # -------------------- FLASK --------------------
 app = Flask(__name__)
@@ -65,16 +50,10 @@ def stats():
         return jsonify({"error": "bot not ready"})
     guild_stats = []
     for guild in client_ref.guilds:
-        key = f"guild:{guild.id}:members"
-        try:
-            count = sync_redis.scard(key)
-        except Exception:
-            count = 0
         guild_stats.append({
             "name": guild.name,
             "id": str(guild.id),
             "memberCount": guild.member_count,
-            "trackedInRedis": count or 0
         })
     return jsonify({
         "totalGuilds": len(client_ref.guilds),
@@ -143,53 +122,26 @@ class MemberMonitor(discord.Client):
     def __init__(self):
         super().__init__(self_bot=True)
         self.poll_task = None
-        self.session = None
-        self.start_time_ms = None
-        self.current_poll_interval = BASE_POLL_INTERVAL_SEC
+        self.current_poll_interval = POLL_INTERVAL_SEC
 
     async def on_ready(self):
         global client_ref
         client_ref = self
         logger.info(f"Selfbot ready → {self.user} | {len(self.guilds)} guilds")
 
-        self.session = aiohttp.ClientSession()
-
-        # Global start time
-        start = await async_redis.get("global:start_time")
-        if not start:
-            self.start_time_ms = int(time.time() * 1000)
-            await async_redis.set("global:start_time", self.start_time_ms)
-        else:
-            self.start_time_ms = int(start)
-
         if not self.poll_task or self.poll_task.done():
             self.poll_task = asyncio.create_task(self.poll_loop())
 
     async def poll_loop(self):
         await asyncio.sleep(3)
-        consecutive_failures = 0
-
         while True:
             cycle_start = time.time()
             logger.info(f"Starting poll cycle — {len(self.guilds)} guilds")
 
-            tasks = []
             for i, guild in enumerate(self.guilds):
                 if i > 0:
                     await asyncio.sleep(GUILD_STAGGER_SEC)
-                tasks.append(self.poll_guild(guild))
-
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            fails = sum(1 for r in results if isinstance(r, Exception))
-
-            if fails > len(self.guilds) // 2:
-                consecutive_failures += 1
-                if consecutive_failures >= 3:
-                    self.current_poll_interval = min(MAX_POLL_INTERVAL_SEC, self.current_poll_interval * 1.5)
-                    logger.warning(f"High failure rate → poll interval now {self.current_poll_interval}s")
-            else:
-                consecutive_failures = 0
-                self.current_poll_interval = BASE_POLL_INTERVAL_SEC
+                await self.poll_guild(guild)
 
             elapsed = time.time() - cycle_start
             wait = max(0, self.current_poll_interval - elapsed) + random.uniform(0, 5)
@@ -199,92 +151,24 @@ class MemberMonitor(discord.Client):
     async def poll_guild(self, guild: discord.Guild):
         logger.info(f"Polling {guild.name} ({guild.id}) — {guild.member_count:,} members")
 
-        members = {}
+        members_count = 0
         try:
             if guild.member_count and guild.member_count < 5000:
                 async for member in guild.fetch_members(limit=None):
-                    members[str(member.id)] = {
-                        'user': {'id': member.id, 'username': str(member)},
-                        'joined_at': member.joined_at
-                    }
+                    members_count += 1
+                logger.info(f"  ✅ Fetched {members_count} members via API")
             else:
                 channel = next((c for c in guild.text_channels
                                 if c.permissions_for(guild.me).read_messages), None)
                 if channel:
                     member_ids = await scrape_members_discum(guild.id, channel.id, USER_TOKEN)
-                    poll_time = datetime.now(timezone.utc)
-                    for uid in member_ids:
-                        members[uid] = {
-                            'user': {'id': int(uid), 'username': 'unknown'},
-                            'joined_at': None,
-                            '_first_seen_at': poll_time
-                        }
+                    logger.info(f"  ✅ Scraped {len(member_ids)} members via discum")
                 else:
-                    for member in guild.members:
-                        members[str(member.id)] = {
-                            'user': {'id': member.id, 'username': str(member)},
-                            'joined_at': member.joined_at
-                        }
-                    logger.warning(f"No readable channel in {guild.name}")
+                    logger.warning(f"  ⚠️ No readable channel in {guild.name} — using cache ({len(guild.members)} members)")
         except Exception as e:
             logger.error(f"Failed polling {guild.name}: {e}")
-            return
-
-        await self.process_members(guild, members)
-
-    async def process_members(self, guild: discord.Guild, members: dict):
-        guild_key = f"guild:{guild.id}:members"
-        is_first_scan = await async_redis.exists(guild_key) == 0
-        new_ids = []
-        notifications = []
-        effective_start = self.start_time_ms - GRACE_PERIOD_MS
-        poll_time_ms = int(time.time() * 1000)
-
-        for user_id, data in members.items():
-            is_known = await async_redis.sismember(guild_key, user_id)
-            if not is_known:
-                new_ids.append(user_id)
-                joined_at = data.get('joined_at')
-                if joined_at:
-                    joined_ms = int(joined_at.timestamp() * 1000)
-                elif '_first_seen_at' in data:
-                    joined_ms = int(data['_first_seen_at'].timestamp() * 1000)
-                else:
-                    joined_ms = poll_time_ms
-
-                if not is_first_scan and joined_ms > effective_start:
-                    notifications.append({
-                        "server": guild.name,
-                        "serverId": str(guild.id),
-                        "userId": user_id,
-                        "username": data.get('user', {}).get('username', 'Unknown'),
-                        "joinedAt": datetime.fromtimestamp(joined_ms/1000, timezone.utc).isoformat(),
-                        "source": "poll"
-                    })
-
-        if new_ids:
-            await async_redis.sadd(guild_key, *new_ids)
-
-        if notifications:
-            await asyncio.gather(*[self.send_notification(p) for p in notifications], return_exceptions=True)
-
-        logger.info(f"{guild.name}: {len(members)} total | {len(new_ids)} new | {len(notifications)} notified")
-
-    async def send_notification(self, payload: dict):
-        for attempt in range(3):
-            try:
-                async with self.session.post(NOTIFY_URL, json=payload, timeout=8) as resp:
-                    if resp.status == 200:
-                        logger.info(f"Notified: {payload.get('username')} → {payload.get('server')}")
-                        return
-            except Exception as e:
-                if attempt == 2:
-                    logger.error(f"Notification failed: {e}")
-                await asyncio.sleep(0.6 * (attempt + 1))
 
     async def close(self):
-        if self.session:
-            await self.session.close()
         await super().close()
 
 # -------------------- START --------------------
